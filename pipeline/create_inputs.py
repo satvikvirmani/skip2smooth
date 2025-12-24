@@ -20,7 +20,6 @@ def create_inputs(retained_indices_path, compressed_video_path, temp_dir):
         
         # Save frame
         file_path = os.path.join(temp_dir, f"frame_{frame_count:04d}.png")
-        frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
         cv2.imwrite(file_path, frame)
         frame_paths.append(file_path)
         frame_count += 1
@@ -31,6 +30,7 @@ def create_inputs(retained_indices_path, compressed_video_path, temp_dir):
     indices = []
     if os.path.exists(retained_indices_path):
         with open(retained_indices_path, 'r') as f:
+            f.seek(0)
             reader = csv.DictReader(f)
             for row in reader:
                 if row['Frame_Index']:

@@ -45,3 +45,10 @@ Thumbs.db
 # Logs / outputs
 # =========================
 *.log
+
+plots/
+metrics/
+output_videos/
+temp_frames_receiver/
+temp_frames_sender/
+temp_frames_app/

@@ -1,14 +1,15 @@
-from interpolater import Interpolator, interpolate_recursively
+from google_film.interpolater import Interpolator
 import mediapy as media
 import requests
 import numpy as np
 import tensorflow as tf
+from create_inputs import create_inputs
+from image_loader import load_image
 
-retained_indices_path = "./metrics/videoplayback2_retained_indices.csv"
-compressed_video_path = "./output_videos/videoplayback2_keyframes.mp4"
+retained_indices_path = "./metrics/tmpcnx4oot9_retained_indices.csv"
+compressed_video_path = "./output_videos/tmpcnx4oot9_keyframes.mp4"
 temp_dir = "./temp_frames"
 BATCH_SIZE = 5
-
 
 interpolator = Interpolator()
 
