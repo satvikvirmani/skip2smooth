@@ -5,8 +5,15 @@ import os
 import tempfile
 import shutil
 import pandas as pd
+import uuid
+import logging
 from pipeline.create_inputs import create_inputs
 from video_compressor import KeyframeSelector
+from db.uploader import upload_files
+
+# Configure logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 st.set_page_config(
     page_title="Skip2Smooth - Send Video",
@@ -15,48 +22,17 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# # --- Custom Styling ---
-# st.markdown("""
-#     <style>
-#     .main {
-#         padding: 0rem 1rem;
-#     }
-#     .stButton>button {
-#         width: 100%;
-#         border-radius: 8px;
-#         font-weight: 600;
-#         transition: all 0.3s ease;
-#     }
-#     .metric-card {
-#         background-color: #f0f2f6;
-#         padding: 1rem;
-#         border-radius: 10px;
-#         text-align: center;
-#         box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-#     }
-#     .success-box {
-#         padding: 1rem;
-#         background-color: #d4edda;
-#         color: #155724;
-#         border-radius: 8px;
-#         margin-top: 1rem;
-#     }
-#     </style>
-# """, unsafe_allow_html=True)
-
 def main():
-    st.title("🎬 Skip2Smooth")
-    st.subheader("Intelligent Video Keyframe Selector & Processor")
+    st.title("Skip2Smooth")
+    st.subheader("Send Video to the Peer")
 
-    # --- Sidebar ---
     with st.sidebar:
         st.header("Instructions")
         st.info("1. Upload Video\n2. Compute Metrics\n3. Select Target Reduction\n4. Compress & Process")
 
-    # --- Main Content ---
     uploaded_file = st.file_uploader("Upload Video", type=['mp4', 'mov', 'avi'])
 
-    # Initialize Session State
+    # Initialize session state with snake_case keys
     if 'processed' not in st.session_state:
         st.session_state.processed = False
     if 'inputs_created' not in st.session_state:
@@ -73,13 +49,15 @@ def main():
         st.session_state.indices_path = None
 
     if uploaded_file is not None:
-        # Check if new file uploaded
         if 'video_path' not in st.session_state or st.session_state.uploaded_file_name != uploaded_file.name:
-            tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-            tfile.write(uploaded_file.read())
-            st.session_state.video_path = tfile.name
+            # Create temp file with descriptive name
+            temp_video_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+            temp_video_file.write(uploaded_file.read())
+            st.session_state.video_path = temp_video_file.name
             st.session_state.uploaded_file_name = uploaded_file.name
-            # Reset state
+            st.session_state.compressed_file_name = None
+            logger.info(f"Video uploaded: {uploaded_file.name}, saved to {temp_video_file.name}")
+
             st.session_state.processed = False
             st.session_state.metrics_computed = False
             st.session_state.compress_ready = False
@@ -88,82 +66,80 @@ def main():
         
         video_path = st.session_state.video_path
         
-        col1, col2 = st.columns(2)
-        with col1:
+        video_column, details_column = st.columns(2)
+        with video_column:
             st.video(video_path)
             st.caption("Original Video")
 
-        # Initialize Pipeline Selector in session state to persist
         if 'selector' not in st.session_state:
-            st.session_state.selector = KeyframeSelector(video_path, verbose=True)
+            st.session_state.selector = KeyframeSelector(video_path, verbose=False)
             
         selector = st.session_state.selector
 
-        # --- Step 1: Compute Metrics ---
         st.divider()
-        st.header("1. Analysis")
+        st.header("Analysis")
         
         if not st.session_state.metrics_computed:
-            if st.button("📊 Compute Metrics", type="primary"):
-                # Callback factory
-                def make_callback(prog_bar, status_text):
+            if st.button("Compute Metrics", type="primary"):
+                def make_callback(progress_bar, status_text_elem):
                     def callback(p, msg):
-                        prog_bar.progress(p)
-                        status_text.text(msg)
+                        progress_bar.progress(p)
+                        status_text_elem.text(msg)
                     return callback
 
-                prog_bar = st.progress(0)
-                status_text = st.empty()
+                progress_bar = st.progress(0, text="Computing metrics (LPIPS, SSIM, MSE)")
+                status_text_elem = st.empty()
                 
                 with st.spinner("Computing metrics (LPIPS, SSIM, MSE)..."):
-                    metrics = selector.compute_metrics(callback=make_callback(prog_bar, status_text))
-                    # Compute reduction options
+                    logger.info("Starting metric computation...")
+                    selector.compute_metrics(callback=make_callback(progress_bar, status_text_elem))
                     st.session_state.reductions = selector.set_reductions(n=200)
+                    logger.info("Metric computation completed.")
                 
-                prog_bar.empty()
-                status_text.empty()
+                progress_bar.empty()
+                status_text_elem.empty()
                 st.session_state.metrics_computed = True
                 st.rerun()
 
         if st.session_state.metrics_computed:
-            # Visualization
-            df_metrics = pd.DataFrame(selector.metrics, columns=["MSE", "Inv SSIM", "LPIPS", "Difference"])
-            st.line_chart(df_metrics[["Difference"]], height=200)
+            st.text("Difference between consecutive frames")
+            metrics_dataframe = pd.DataFrame(selector.metrics, columns=["MSE", "Inv SSIM", "LPIPS", "Difference"])
+            st.line_chart(metrics_dataframe[["Difference"]], height=200)
             
-            # --- Step 2: Select Reduction ---
-            st.header("2. Compression Settings")
+            st.header("Compression Settings")
             
-            # Slider for reduction %
             reductions = st.session_state.reductions
-            min_red = min(r['reduction_percent'] for r in reductions)
-            max_red = max(r['reduction_percent'] for r in reductions)
+            min_reduction = min(r['reduction_percent'] for r in reductions)
+            max_reduction = max(r['reduction_percent'] for r in reductions)
             
-            target_red = st.slider(
+            target_reduction = st.slider(
                 "Target Size Reduction (%)", 
-                min_value=min_red, 
-                max_value=max_red, 
-                value=(min_red + max_red)/2,
+                min_value=min_reduction, 
+                max_value=max_reduction, 
+                value=(min_reduction + max_reduction)/2,
                 format="%.1f%%"
             )
             
-            # Find closest matching reduction setting
-            best_match = min(reductions, key=lambda x: abs(x['reduction_percent'] - target_red))
+            best_match = min(reductions, key=lambda x: abs(x['reduction_percent'] - target_reduction))
             
             st.info(f"Paramters: Abs={best_match['abs_thres']:.2f}, Delta={best_match['delta_thres']:.2f}, Adapt={best_match['adapt_factor']:.2f}")
 
-            if st.button("🚀 Compress Video", type="primary"):
-                 # Callback factory
-                def make_callback(prog_bar, status_text):
+            if st.button("Compress Video", type="primary"):
+                def make_callback(progress_bar, status_text_elem):
                     def callback(p, msg):
-                        prog_bar.progress(p)
-                        status_text.text(msg)
+                        progress_bar.progress(p)
+                        status_text_elem.text(msg)
                     return callback
                 
-                prog_bar = st.progress(0)
-                status_text = st.empty()
+                progress_bar = st.progress(0, text="Selecting keyframes and compressing video")
+                status_text_elem = st.empty()
                 
+                # Generate unique identifier for this compression job
+                identifier = str(uuid.uuid4())
+                st.session_state.identifier = identifier
+                logger.info(f"Started compression job with identifier: {identifier}")
+
                 with st.spinner("Selecting keyframes and compressing..."):
-                    # Use selected parameters
                     selector.select_keyframes(
                         abs_thres=best_match['abs_thres'],
                         delta_thres=best_match['delta_thres'],
@@ -171,78 +147,98 @@ def main():
                     )
                     
                     selector.create_retained_indices_file()
-                    selector.create_compressed_video(callback=make_callback(prog_bar, status_text))
+                    selector.create_compressed_video(callback=make_callback(progress_bar, status_text_elem))
                     
-                    prog_bar.empty()
-                    status_text.empty()
+                    progress_bar.empty()
+                    status_text_elem.empty()
                     
-                    # Update paths
-                    st.session_state.compressed_path = selector.output_video
-                    video_name = os.path.splitext(os.path.basename(video_path))[0]
-                    st.session_state.indices_path = os.path.join(selector.metrics_dir, f"{video_name}_retained_indices.csv")
+                    # Rename files to match identifier
+                    original_compressed_path = selector.output_video
+                    # Assuming default naming convention from KeyframeSelector, we'll need to robustly find it if possible
+                    # but since we can't see KeyframeSelector code, we rely on selector.output_video being correct.
                     
-                    # Stats
+                    # Construct expected indices path based on previous code logic
+                    video_name_no_ext = os.path.splitext(os.path.basename(video_path))[0]
+                    original_indices_path = os.path.join(selector.metrics_dir, f"{video_name_no_ext}_retained_indices.csv")
+                    
+                    new_compressed_name = f"{identifier}.mp4"
+                    new_indices_name = f"{identifier}_indices.csv"
+                    
+                    new_compressed_path = os.path.join(os.path.dirname(original_compressed_path), new_compressed_name)
+                    new_indices_path = os.path.join(os.path.dirname(original_indices_path), new_indices_name)
+                    
+                    # Rename
+                    try:
+                        os.rename(original_compressed_path, new_compressed_path)
+                        logger.info(f"Renamed compressed video to {new_compressed_path}")
+                    except OSError as e:
+                        logger.error(f"Failed to rename compressed video: {e}")
+
+                    if os.path.exists(original_indices_path):
+                        try:
+                            os.rename(original_indices_path, new_indices_path)
+                            logger.info(f"Renamed indices file to {new_indices_path}")
+                        except OSError as e:
+                            logger.error(f"Failed to rename indices file: {e}")
+                    else:
+                        logger.warning(f"Indices file not found at {original_indices_path}")
+
+                    st.session_state.compressed_path = new_compressed_path
+                    st.session_state.compressed_file_name = new_compressed_name
+                    st.session_state.indices_path = new_indices_path
+                    st.session_state.indices_file_name = new_indices_name
+                    
+                    # Update selector path so get_sizes works if it checks the file
+                    selector.output_video = new_compressed_path 
+                    
                     orig_size, comp_size = selector.get_sizes()
+
                     st.session_state.orig_size = orig_size
                     st.session_state.comp_size = comp_size
                     st.session_state.reduction = (1 - (comp_size / orig_size)) * 100
                     st.session_state.processed = True
+                    logger.info("Compression and processing completed.")
                     st.rerun()
 
-        # Display Results if processed
         if st.session_state.processed:
-            c1, c2, c3 = st.columns(3)
-            with c1:
+            metric_col1, metric_col2, metric_col3 = st.columns(3)
+            with metric_col1:
                 st.metric("Original Size", f"{st.session_state.orig_size:.2f} MB")
-            with c2:
+            with metric_col2:
                 st.metric("Compressed Size", f"{st.session_state.comp_size:.2f} MB")
-            with c3:
+            with metric_col3:
                 st.metric("Size Reduction", f"{st.session_state.reduction:.1f}%", delta_color="normal")
 
-            with col2:
+            with details_column:
                 if st.session_state.compressed_path and os.path.exists(st.session_state.compressed_path):
                     st.video(st.session_state.compressed_path)
                     st.caption("Compressed Video (Keyframes Only)")
                 else:
                     st.error("Output video file not found.")
 
-            # --- Step 2: Create Inputs ---
             st.divider()
-            st.header("2. Model Inputs")
-            
-            if st.button("🛠 Create Model Inputs"):
-                temp_dir = "temp_frames_app"
-                with st.spinner("Extracting frames and preparing segments..."):
-                    inputs = create_inputs(
-                        st.session_state.indices_path, 
-                        st.session_state.compressed_path, 
-                        temp_dir
-                    )
-                    st.session_state.inputs_created = True
-                    st.session_state.num_segments = len(inputs)
-                    active_tasks = sum(1 for x in inputs if x['times_to_interpolate'] > 0)
-                    st.session_state.active_tasks = active_tasks
+            st.header("Send Video to Peer")
                 
-                st.success(f"Inputs Created! Prepared {len(inputs)} segments.")
-                
-            if st.session_state.inputs_created:
-                st.info(f"Ready to interpolate {st.session_state.active_tasks} gaps in {st.session_state.num_segments} total segments.")
-
-                # --- Step 3: Send to Model ---
-                st.divider()
-                st.header("3. Run Inference")
-                
-                if st.button("✨ Send to Model (Dummy)"):
-                    with st.spinner("Sending data to model API..."):
-                        import time
-                        time.sleep(1.5) 
-                    st.balloons()
-                    st.markdown("""
-                        <div class="success-box">
-                            <h3>✅ Sent Successfully!</h3>
-                            <p>The video segments have been queued for frame interpolation.</p>
-                        </div>
-                    """, unsafe_allow_html=True)
+            if st.button("Send", type="primary"):
+                identifier = st.session_state.identifier
+                with st.spinner("Sending"):
+                    logger.info(f"Uploading files for identifier {identifier}")
+                    try:
+                        with open(st.session_state.compressed_path, "rb") as video_file, \
+                             open(st.session_state.indices_path, "rb") as indices_file:
+                            
+                            returned_id = upload_files(
+                                identifier=identifier,
+                                video_file=video_file,
+                                video_filename=st.session_state.compressed_file_name,
+                                indices_file=indices_file,
+                                indices_filename=st.session_state.indices_file_name
+                            )
+                        st.success("Files Sent Successfully - Copy the below string to send to peers")
+                        st.info(returned_id)
+                    except Exception as e:
+                        st.error(f"Failed to send files: {e}")
+                        logger.error(f"Upload failed: {e}")
 
 if __name__ == "__main__":
     main()

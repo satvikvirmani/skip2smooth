@@ -7,9 +7,15 @@ import shutil
 import time
 import subprocess
 import mediapy as media
+import logging
 from pipeline.create_inputs import create_inputs
 from pipeline.google_film.interpolater import Interpolator
 from pipeline.image_loader import load_image
+from db.retriever import retrieve_files
+
+# Configure logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 st.set_page_config(
     page_title="Skip2Smooth - Receive Video",
@@ -17,30 +23,8 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# # --- Custom Styling (Reuse) ---
-# st.markdown("""
-#     <style>
-#     .main {
-#         padding: 0rem 1rem;
-#     }
-#     .stButton>button {
-#         width: 100%;
-#         border-radius: 8px;
-#         font-weight: 600;
-#         transition: all 0.3s ease;
-#     }
-#     .success-box {
-#         padding: 1rem;
-#         background-color: #d4edda;
-#         color: #155724;
-#         border-radius: 8px;
-#         margin-top: 1rem;
-#     }
-#     </style>
-# """, unsafe_allow_html=True)
-
-def reconstruct_video(inputs, output_path, fps=30, prog_bar=None, status_text=None):
-    BATCH_SIZE = 1 # Keep low for safety on general hardware
+def reconstruct_video(inputs, output_path, fps=30, progress_bar=None, status_text_elem=None):
+    batch_size = 1 # Keep low for safety on general hardware
     interpolator = Interpolator()
     final_frames_dir = "temp_reconstruction_frames"
     
@@ -50,7 +34,7 @@ def reconstruct_video(inputs, output_path, fps=30, prog_bar=None, status_text=No
 
     final_frames = []
 
-    print("Starting interpolation...")
+    logger.info("Starting interpolation...")
 
     for i, input_data in enumerate(inputs):
         times_to_interpolate = input_data['times_to_interpolate']
@@ -62,8 +46,8 @@ def reconstruct_video(inputs, output_path, fps=30, prog_bar=None, status_text=No
         if times_to_interpolate > 0:
             dt_all = np.linspace(0, 1, num=times_to_interpolate + 2)[1:-1].astype(np.float32)
 
-            for b_start in range(0, len(dt_all), BATCH_SIZE):
-                b_end = min(b_start + BATCH_SIZE, len(dt_all))
+            for b_start in range(0, len(dt_all), batch_size):
+                b_end = min(b_start + batch_size, len(dt_all))
                 dt_chunk = dt_all[b_start:b_end]
 
                 current_batch_size = len(dt_chunk)
@@ -74,91 +58,87 @@ def reconstruct_video(inputs, output_path, fps=30, prog_bar=None, status_text=No
 
                 segment_frames.extend([mid_frames[j] for j in range(len(mid_frames))])
 
-            print(f"Interpolated segment {i}: added {len(mid_frames)} frames.")
+            logger.info(f"Interpolated segment {i}: added {len(mid_frames)} frames.")
         
-        prog_bar.progress(i / len(inputs))
+        if progress_bar:
+            progress_bar.progress(i / len(inputs))
 
         final_frames.extend(segment_frames)
 
         if i == len(inputs) - 1:
             final_frames.append(frame2)
 
-    prog_bar.empty()
-    status_text.text("Stitching video...")
+    if progress_bar:
+        progress_bar.empty()
+    if status_text_elem:
+        status_text_elem.text("Stitching video...")
     
     # Use ffmpeg to stitch
-    print(f'Final video created with {len(final_frames)} frames')
+    logger.info(f'Final video created with {len(final_frames)} frames')
     media.write_video(output_path, final_frames, fps=30)
     
     shutil.rmtree(final_frames_dir)
 
 def main():
-    st.title("📥 Receiver")
+    st.title("Receiver")
     st.subheader("Reconstruct Video from Compressed Data")
     
-    # --- Input Section ---
     st.divider()
-    
-    col1, col2 = st.columns(2)
-    
-    video_file = None
-    indices_file = None
-    
-    with col1:
-        st.info("Upload Compressed Video (.mp4)")
-        video_upload = st.file_uploader("Compressed Video", type=['mp4'], key="vid_up")
-        if video_upload:
-            tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-            tfile.write(video_upload.read())
-            video_file = tfile.name
-    
-    with col2:
-        st.info("Upload Indices CSV")
-        csv_upload = st.file_uploader("Retained Indices", type=['csv'], key="csv_up")
-        if csv_upload:
-            with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="wb") as tmp:
-                tmp.write(csv_upload.getbuffer())
-                indices_file = tmp.name
 
+    video_file_path = None
+    indices_file_path = None
+    temp_download_dir = "temp_downloads"
 
-    # --- Local Load Option ---
-    if st.checkbox("Or load latest local files (Development Mode)"):
-        # Attempt to find latest in output_videos and metrics
-        try:
-             # Basic finding logic - hardcoded for demo or list dir
-             # Assuming standard paths:
-             # ./output_videos and ./metrics
-             pass
-        except:
-             st.warning("Could not auto-load files.")
+    identifier_input = st.text_input("Enter Video Identifier", help="Paste the UUID provided by the sender")
+    if st.button("Retrieve Files", type="primary"):
+        if identifier_input:
+            with st.spinner("Retrieving files from server..."):
+                retrieved = retrieve_files(identifier_input.strip(), temp_download_dir)
+                if retrieved:
+                    st.session_state['retrieved_video'] = retrieved['video_path']
+                    st.session_state['retrieved_indices'] = retrieved['indices_path']
+                    st.success("Files retrieved successfully!")
+                else:
+                    st.error("Failed to retrieve files. Check identifier or connection.")
+        else:
+            st.warning("Please enter an identifier.")
+        
+    if 'retrieved_video' in st.session_state and os.path.exists(st.session_state['retrieved_video']):
+        video_file_path = st.session_state['retrieved_video']
+        indices_file_path = st.session_state['retrieved_indices']
+        st.info(f"Using retrieved files: {os.path.basename(video_file_path)}")
 
-    if video_file and indices_file:
-         st.success("Files loaded. Ready to reconstruct.")
+    if video_file_path and indices_file_path:
+         st.success("Files ready. Starting reconstruction setup...")
          
          if st.button("✨ Reconstruct Video", type="primary"):
              temp_dir = "temp_frames_receiver"
              output_video_path = "reconstructed_video.mp4"
              
              with st.spinner("Preparing segments..."):
-                 print(video_file)
-                 print(indices_file)
-                 print(temp_dir)
-                 inputs = create_inputs(indices_file, video_file, temp_dir)
+                 logger.info(f"Video file: {video_file_path}")
+                 logger.info(f"Indices file: {indices_file_path}")
+                 logger.info(f"Temp dir: {temp_dir}")
+                 inputs = create_inputs(indices_file_path, video_file_path, temp_dir)
                  
              st.info(f"Interpolating {len(inputs)} segments...")
-             prog_bar = st.progress(0)
-             status_text = st.empty()
+             progress_bar = st.progress(0)
+             status_text_elem = st.empty()
              
              try:
-                 reconstruct_video(inputs, output_video_path, prog_bar=prog_bar, status_text=status_text)
+                 reconstruct_video(inputs, output_video_path, progress_bar=progress_bar, status_text_elem=status_text_elem)
                  st.success("Reconstruction Complete!")
                  st.video(output_video_path)
                  
-                 # Cleanup
+                 # Cleanup temp reconstruction frames
                  if os.path.exists(temp_dir):
                      shutil.rmtree(temp_dir)
              except Exception as e:
                  st.error(f"Error during reconstruction: {str(e)}")
+                 logger.error(f"Error during reconstruction: {str(e)}")
+
+             # Cleanup downloaded files if in retrieval mode (optional, maybe user wants to keep them for a bit)
+             # For now, let's leave them in temp_downloads until next run or OS cleanup.
 
 if __name__ == "__main__":
     main()
