@@ -1,4 +1,4 @@
-# 🎬 Skip2Smooth
+# Skip2Smooth
 
 ### Intelligent Video Compression & Reconstruction System
 
